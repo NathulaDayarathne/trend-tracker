@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
+	"sync"
+	"time"
 )
 
-// Story mirrors the fields we care about from the HN item endpoint.
-// The `json:"..."` tags map each lowercase JSON key to our Go field.
 type Story struct {
 	ID    int    `json:"id"`
 	Title string `json:"title"`
@@ -19,27 +20,83 @@ type Story struct {
 
 const base = "https://hacker-news.firebaseio.com/v0"
 
+// One shared client with a timeout. http.Get uses a default client with NO
+// timeout, which can hang forever — never use it in real code.
+var client = &http.Client{Timeout: 10 * time.Second}
+
 func main() {
-	// 1. Fetch the list of top story IDs.
+	const (
+		topN    = 50 // how many stories to fetch
+		workers = 8  // how many at a time
+	)
+
+	start := time.Now()
+
 	ids, err := fetchTopIDs()
 	if err != nil {
 		log.Fatalf("fetching top IDs: %v", err)
 	}
-	fmt.Println("first 5 IDs:", ids[:5])
-
-	// 2. Fetch details for the first 5 and print their titles.
-	for _, id := range ids[:5] {
-		story, err := fetchStory(id)
-		if err != nil {
-			log.Printf("fetching story %d: %v", id, err)
-			continue
-		}
-		fmt.Printf("[%d pts] %s\n", story.Score, story.Title)
+	if len(ids) > topN {
+		ids = ids[:topN]
 	}
+	log.Printf("fetching %d stories with %d workers", len(ids), workers)
+
+	idCh := make(chan int)       // work in
+	resultCh := make(chan Story) // results out
+
+	// --- fan out: start the worker pool ---
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			// Loops until idCh is closed and drained.
+			for id := range idCh {
+				s, err := fetchStory(id)
+				if err != nil {
+					log.Printf("worker %d: story %d: %v", workerID, id, err)
+					continue
+				}
+				if s.Title == "" {
+					continue // deleted or dead item
+				}
+				resultCh <- s
+			}
+		}(i)
+	}
+
+	// --- feed the workers, then signal "no more work" ---
+	go func() {
+		for _, id := range ids {
+			idCh <- id
+		}
+		close(idCh)
+	}()
+
+	// --- close resultCh once every worker has exited ---
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// --- fan in: collect until resultCh closes ---
+	var stories []Story
+	for s := range resultCh {
+		stories = append(stories, s)
+	}
+
+	sort.Slice(stories, func(i, j int) bool {
+		return stories[i].Score > stories[j].Score
+	})
+
+	for _, s := range stories {
+		fmt.Printf("[%4d pts] %s\n", s.Score, s.Title)
+	}
+	log.Printf("fetched %d stories in %s", len(stories), time.Since(start).Round(time.Millisecond))
 }
 
 func fetchTopIDs() ([]int, error) {
-	resp, err := http.Get(base + "/topstories.json")
+	resp, err := client.Get(base + "/topstories.json")
 	if err != nil {
 		return nil, err
 	}
@@ -53,8 +110,7 @@ func fetchTopIDs() ([]int, error) {
 }
 
 func fetchStory(id int) (Story, error) {
-	url := fmt.Sprintf("%s/item/%d.json", base, id)
-	resp, err := http.Get(url)
+	resp, err := client.Get(fmt.Sprintf("%s/item/%d.json", base, id))
 	if err != nil {
 		return Story{}, err
 	}
