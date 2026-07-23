@@ -13,6 +13,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // TrendItem is the message contract between scraper and processor.
@@ -39,6 +42,28 @@ const base = "https://hacker-news.firebaseio.com/v0"
 
 var client = &http.Client{Timeout: 10 * time.Second}
 
+// promauto registers each metric automatically so /metrics picks it up.
+// These live at file level so the worker goroutines can reach them.
+var (
+	itemsScraped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "scraper_items_scraped_total",
+		Help: "Total stories successfully fetched.",
+	})
+	itemsPublished = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "scraper_items_published_total",
+		Help: "Total items published to the queue.",
+	})
+	scrapeErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "scraper_errors_total",
+		Help: "Total fetch or publish errors.",
+	})
+	runDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "scraper_run_duration_seconds",
+		Help:    "How long a full scrape run takes.",
+		Buckets: prometheus.DefBuckets,
+	})
+)
+
 func main() {
 	const (
 		topN    = 50
@@ -47,6 +72,16 @@ func main() {
 
 	ctx := context.Background()
 	start := time.Now()
+
+	// Expose metrics for Prometheus to read. Runs in a goroutine because
+	// ListenAndServe blocks forever.
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		log.Println("metrics on :8080/metrics")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Printf("metrics server: %v", err)
+		}
+	}()
 
 	// --- connect to the queue ---
 	sqsClient, queueURL, err := setupQueue(ctx)
@@ -67,7 +102,7 @@ func main() {
 	idCh := make(chan int)
 	var wg sync.WaitGroup
 	var published, failed int64
-	var mu sync.Mutex // guards the counters
+	var mu sync.Mutex // guards the plain int counters below
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -76,13 +111,17 @@ func main() {
 			for id := range idCh {
 				s, err := fetchStory(id)
 				if err != nil {
+					scrapeErrors.Inc()
 					log.Printf("worker %d: fetch %d: %v", workerID, id, err)
-					mu.Lock(); failed++; mu.Unlock()
+					mu.Lock()
+					failed++
+					mu.Unlock()
 					continue
 				}
 				if s.Title == "" {
 					continue
 				}
+				itemsScraped.Inc()
 
 				item := TrendItem{
 					ID:        s.ID,
@@ -95,11 +134,17 @@ func main() {
 				}
 
 				if err := publish(ctx, sqsClient, queueURL, item); err != nil {
+					scrapeErrors.Inc()
 					log.Printf("worker %d: publish %d: %v", workerID, id, err)
-					mu.Lock(); failed++; mu.Unlock()
+					mu.Lock()
+					failed++
+					mu.Unlock()
 					continue
 				}
-				mu.Lock(); published++; mu.Unlock()
+				itemsPublished.Inc()
+				mu.Lock()
+				published++
+				mu.Unlock()
 			}
 		}(i)
 	}
@@ -110,14 +155,22 @@ func main() {
 	close(idCh)
 	wg.Wait()
 
+	runDuration.Observe(time.Since(start).Seconds())
+
 	log.Printf("published %d items (%d failed) in %s",
 		published, failed, time.Since(start).Round(time.Millisecond))
+
+	// Keep the process alive so Prometheus can scrape /metrics.
+	// Step 8 replaces this with a Kubernetes CronJob that exits instead.
+	log.Println("run complete — staying up for metrics. Ctrl+C to stop.")
+	select {}
 }
 
 // setupQueue builds an SQS client pointed at ElasticMQ (or real AWS) and
 // creates the queue if it doesn't exist yet, returning its URL.
 func setupQueue(ctx context.Context) (*sqs.Client, string, error) {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(envOr("AWS_REGION", "us-east-1")))
+	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(envOr("AWS_REGION", "us-east-1")))
 	if err != nil {
 		return nil, "", err
 	}
