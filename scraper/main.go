@@ -1,14 +1,31 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"sort"
+	"os"
 	"sync"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
+
+// TrendItem is the message contract between scraper and processor.
+// Both services must agree on this shape.
+type TrendItem struct {
+	ID        int       `json:"id"`
+	Title     string    `json:"title"`
+	URL       string    `json:"url"`
+	Score     int       `json:"score"`
+	Author    string    `json:"author"`
+	Source    string    `json:"source"`
+	ScrapedAt time.Time `json:"scraped_at"`
+}
 
 type Story struct {
 	ID    int    `json:"id"`
@@ -20,17 +37,23 @@ type Story struct {
 
 const base = "https://hacker-news.firebaseio.com/v0"
 
-// One shared client with a timeout. http.Get uses a default client with NO
-// timeout, which can hang forever — never use it in real code.
 var client = &http.Client{Timeout: 10 * time.Second}
 
 func main() {
 	const (
-		topN    = 50 // how many stories to fetch
-		workers = 8  // how many at a time
+		topN    = 50
+		workers = 8
 	)
 
+	ctx := context.Background()
 	start := time.Now()
+
+	// --- connect to the queue ---
+	sqsClient, queueURL, err := setupQueue(ctx)
+	if err != nil {
+		log.Fatalf("queue setup: %v", err)
+	}
+	log.Printf("publishing to %s", queueURL)
 
 	ids, err := fetchTopIDs()
 	if err != nil {
@@ -39,60 +62,93 @@ func main() {
 	if len(ids) > topN {
 		ids = ids[:topN]
 	}
-	log.Printf("fetching %d stories with %d workers", len(ids), workers)
+	log.Printf("scraping %d stories with %d workers", len(ids), workers)
 
-	idCh := make(chan int)       // work in
-	resultCh := make(chan Story) // results out
-
-	// --- fan out: start the worker pool ---
+	idCh := make(chan int)
 	var wg sync.WaitGroup
+	var published, failed int64
+	var mu sync.Mutex // guards the counters
+
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			// Loops until idCh is closed and drained.
 			for id := range idCh {
 				s, err := fetchStory(id)
 				if err != nil {
-					log.Printf("worker %d: story %d: %v", workerID, id, err)
+					log.Printf("worker %d: fetch %d: %v", workerID, id, err)
+					mu.Lock(); failed++; mu.Unlock()
 					continue
 				}
 				if s.Title == "" {
-					continue // deleted or dead item
+					continue
 				}
-				resultCh <- s
+
+				item := TrendItem{
+					ID:        s.ID,
+					Title:     s.Title,
+					URL:       s.URL,
+					Score:     s.Score,
+					Author:    s.By,
+					Source:    "hackernews",
+					ScrapedAt: time.Now().UTC(),
+				}
+
+				if err := publish(ctx, sqsClient, queueURL, item); err != nil {
+					log.Printf("worker %d: publish %d: %v", workerID, id, err)
+					mu.Lock(); failed++; mu.Unlock()
+					continue
+				}
+				mu.Lock(); published++; mu.Unlock()
 			}
 		}(i)
 	}
 
-	// --- feed the workers, then signal "no more work" ---
-	go func() {
-		for _, id := range ids {
-			idCh <- id
-		}
-		close(idCh)
-	}()
+	for _, id := range ids {
+		idCh <- id
+	}
+	close(idCh)
+	wg.Wait()
 
-	// --- close resultCh once every worker has exited ---
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
+	log.Printf("published %d items (%d failed) in %s",
+		published, failed, time.Since(start).Round(time.Millisecond))
+}
 
-	// --- fan in: collect until resultCh closes ---
-	var stories []Story
-	for s := range resultCh {
-		stories = append(stories, s)
+// setupQueue builds an SQS client pointed at ElasticMQ (or real AWS) and
+// creates the queue if it doesn't exist yet, returning its URL.
+func setupQueue(ctx context.Context) (*sqs.Client, string, error) {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(envOr("AWS_REGION", "us-east-1")))
+	if err != nil {
+		return nil, "", err
 	}
 
-	sort.Slice(stories, func(i, j int) bool {
-		return stories[i].Score > stories[j].Score
+	c := sqs.NewFromConfig(cfg, func(o *sqs.Options) {
+		// Pointing at ElasticMQ instead of AWS. Unset this for real SQS.
+		if ep := envOr("SQS_ENDPOINT", "http://localhost:9324"); ep != "" {
+			o.BaseEndpoint = aws.String(ep)
+		}
 	})
 
-	for _, s := range stories {
-		fmt.Printf("[%4d pts] %s\n", s.Score, s.Title)
+	out, err := c.CreateQueue(ctx, &sqs.CreateQueueInput{
+		QueueName: aws.String(envOr("QUEUE_NAME", "trends")),
+	})
+	if err != nil {
+		return nil, "", err
 	}
-	log.Printf("fetched %d stories in %s", len(stories), time.Since(start).Round(time.Millisecond))
+	return c, aws.ToString(out.QueueUrl), nil
+}
+
+// publish serializes one item to JSON and sends it as a queue message.
+func publish(ctx context.Context, c *sqs.Client, queueURL string, item TrendItem) error {
+	body, err := json.Marshal(item)
+	if err != nil {
+		return err
+	}
+	_, err = c.SendMessage(ctx, &sqs.SendMessageInput{
+		QueueUrl:    aws.String(queueURL),
+		MessageBody: aws.String(string(body)),
+	})
+	return err
 }
 
 func fetchTopIDs() ([]int, error) {
@@ -121,4 +177,11 @@ func fetchStory(id int) (Story, error) {
 		return Story{}, err
 	}
 	return s, nil
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
