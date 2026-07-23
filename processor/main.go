@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,8 +16,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// TrendItem must match the scraper's struct exactly — this is the contract
+// between the two programs. Same JSON tags, same field names.
 type TrendItem struct {
 	ID        int       `json:"id"`
 	Title     string    `json:"title"`
@@ -27,17 +33,45 @@ type TrendItem struct {
 	ScrapedAt time.Time `json:"scraped_at"`
 }
 
+// Metrics live at file level so every function can reach them.
+var (
+	processed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "processor_messages_processed_total",
+		Help: "Messages successfully stored.",
+	})
+	failedMsgs = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "processor_messages_failed_total",
+		Help: "Messages that failed to store.",
+	})
+	dbLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "processor_db_write_seconds",
+		Help:    "Time to write one message to the database.",
+		Buckets: prometheus.DefBuckets,
+	})
+	batchSize = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "processor_last_batch_size",
+		Help: "Messages returned by the most recent receive.",
+	})
+)
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Expose metrics on 8081 (8080 belongs to the scraper).
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		log.Println("metrics on :8081/metrics")
+		if err := http.ListenAndServe(":8081", nil); err != nil {
+			log.Printf("metrics server: %v", err)
+		}
+	}()
+
 	// --- connect to Postgres ---
 	dsn := envOr("DATABASE_URL",
 		"postgres://trends:trends@localhost:5432/trends?sslmode=disable")
 
-	// A pool holds several reusable connections instead of opening a new one
-	// per query. Cheap, and lets many goroutines share it safely.
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		log.Fatalf("connect postgres: %v", err)
@@ -52,7 +86,7 @@ func main() {
 	}
 	log.Println("database ready")
 
-	// --- connect to the queue (unchanged) ---
+	// --- connect to the queue ---
 	client, queueURL, err := setupQueue(ctx)
 	if err != nil {
 		log.Fatalf("queue setup: %v", err)
@@ -82,17 +116,21 @@ func main() {
 			time.Sleep(2 * time.Second)
 			continue
 		}
+
+		batchSize.Set(float64(len(out.Messages)))
+
 		if len(out.Messages) == 0 {
 			log.Println("queue empty, still listening...")
 			continue
 		}
 
 		for _, msg := range out.Messages {
-			// The work is now a database write instead of a print.
 			if err := store(ctx, pool, msg); err != nil {
+				failedMsgs.Inc()
 				log.Printf("store failed, will retry: %v", err)
 				continue // don't delete — let it become visible again
 			}
+			processed.Inc()
 			count++
 
 			_, err := client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
@@ -115,6 +153,10 @@ func store(ctx context.Context, pool *pgxpool.Pool, msg types.Message) error {
 		return err
 	}
 
+	// Time the database work for the latency histogram.
+	start := time.Now()
+	defer func() { dbLatency.Observe(time.Since(start).Seconds()) }()
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -123,8 +165,6 @@ func store(ctx context.Context, pool *pgxpool.Pool, msg types.Message) error {
 	// After a successful Commit it's a harmless no-op.
 	defer tx.Rollback(ctx)
 
-	// $1, $2... are placeholders. Never build SQL by string concatenation —
-	// that's how SQL injection happens.
 	_, err = tx.Exec(ctx, `
 		INSERT INTO items (id, title, url, score, author, source, scraped_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -217,6 +257,8 @@ func waitForDB(ctx context.Context, pool *pgxpool.Pool) error {
 	return last
 }
 
+// setupQueue is nearly identical to the scraper's — same endpoint, same queue
+// name. That's how the two programs find each other.
 func setupQueue(ctx context.Context) (*sqs.Client, string, error) {
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(envOr("AWS_REGION", "us-east-1")))
