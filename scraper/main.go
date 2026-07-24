@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -18,32 +19,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// TrendItem is the message contract between scraper and processor.
-// Both services must agree on this shape.
-type TrendItem struct {
-	ID        int       `json:"id"`
-	Title     string    `json:"title"`
-	URL       string    `json:"url"`
-	Score     int       `json:"score"`
-	Author    string    `json:"author"`
-	Source    string    `json:"source"`
-	ScrapedAt time.Time `json:"scraped_at"`
-}
-
-type Story struct {
-	ID    int    `json:"id"`
-	Title string `json:"title"`
-	URL   string `json:"url"`
-	Score int    `json:"score"`
-	By    string `json:"by"`
-}
-
-const base = "https://hacker-news.firebaseio.com/v0"
-
-var client = &http.Client{Timeout: 10 * time.Second}
-
+// ---- Prometheus metrics (step 6) --------------------------------------------
 // promauto registers each metric automatically so /metrics picks it up.
-// These live at file level so the worker goroutines can reach them.
+// These are safe to call from many goroutines at once — no mutex needed.
+
 var (
 	itemsScraped = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "scraper_items_scraped_total",
@@ -64,35 +43,84 @@ var (
 	})
 )
 
+// ---- Types ------------------------------------------------------------------
+
+// TrendItem is the message contract between scraper and processor.
+type TrendItem struct {
+	ID        int       `json:"id"`
+	Title     string    `json:"title"`
+	URL       string    `json:"url"`
+	Score     int       `json:"score"`
+	Author    string    `json:"author"`
+	Source    string    `json:"source"`
+	ScrapedAt time.Time `json:"scraped_at"`
+}
+
+// Story is the shape we decode from the Hacker News API.
+type Story struct {
+	ID    int    `json:"id"`
+	Title string `json:"title"`
+	URL   string `json:"url"`
+	Score int    `json:"score"`
+	By    string `json:"by"`
+}
+
+const base = "https://hacker-news.firebaseio.com/v0"
+
+var client = &http.Client{Timeout: 10 * time.Second}
+
+// ---- main -------------------------------------------------------------------
+
 func main() {
-	const (
-		topN    = 50
-		workers = 8
-	)
-
 	ctx := context.Background()
-	start := time.Now()
 
-	// Expose metrics for Prometheus to read. Runs in a goroutine because
-	// ListenAndServe blocks forever.
+	// Serve metrics so Prometheus can scrape us.
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
-		log.Println("metrics on :8080/metrics")
-		if err := http.ListenAndServe(":8080", nil); err != nil {
+		addr := envOr("METRICS_ADDR", ":8080")
+		log.Printf("metrics on %s/metrics", addr)
+		if err := http.ListenAndServe(addr, nil); err != nil {
 			log.Printf("metrics server: %v", err)
 		}
 	}()
 
-	// --- connect to the queue ---
 	sqsClient, queueURL, err := setupQueue(ctx)
 	if err != nil {
 		log.Fatalf("queue setup: %v", err)
 	}
 	log.Printf("publishing to %s", queueURL)
 
+	// Scrape once immediately, then on a ticker.
+	runScrape(ctx, sqsClient, queueURL)
+
+	interval := time.Duration(envInt("INTERVAL_SECONDS", 60)) * time.Second
+	log.Printf("first run complete — looping every %s. Ctrl+C to stop.", interval)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		runScrape(ctx, sqsClient, queueURL)
+	}
+}
+
+// ---- one scrape run ---------------------------------------------------------
+
+// runScrape fetches the top stories concurrently and publishes each one to the
+// queue. This is everything that used to live inline in main().
+func runScrape(ctx context.Context, sqsClient *sqs.Client, queueURL string) {
+	topN := envInt("TOP_N", 50)
+	workers := envInt("WORKERS", 8)
+
+	start := time.Now()
+	// Record how long the whole run took, however we exit.
+	defer func() { runDuration.Observe(time.Since(start).Seconds()) }()
+
 	ids, err := fetchTopIDs()
 	if err != nil {
-		log.Fatalf("fetching top IDs: %v", err)
+		scrapeErrors.Inc()
+		log.Printf("fetching top IDs: %v", err)
+		return
 	}
 	if len(ids) > topN {
 		ids = ids[:topN]
@@ -119,7 +147,7 @@ func main() {
 					continue
 				}
 				if s.Title == "" {
-					continue
+					continue // deleted or dead item
 				}
 				itemsScraped.Inc()
 
@@ -155,16 +183,11 @@ func main() {
 	close(idCh)
 	wg.Wait()
 
-	runDuration.Observe(time.Since(start).Seconds())
-
 	log.Printf("published %d items (%d failed) in %s",
 		published, failed, time.Since(start).Round(time.Millisecond))
-
-	// Keep the process alive so Prometheus can scrape /metrics.
-	// Step 8 replaces this with a Kubernetes CronJob that exits instead.
-	log.Println("run complete — staying up for metrics. Ctrl+C to stop.")
-	select {}
 }
+
+// ---- queue ------------------------------------------------------------------
 
 // setupQueue builds an SQS client pointed at ElasticMQ (or real AWS) and
 // creates the queue if it doesn't exist yet, returning its URL.
@@ -176,7 +199,6 @@ func setupQueue(ctx context.Context) (*sqs.Client, string, error) {
 	}
 
 	c := sqs.NewFromConfig(cfg, func(o *sqs.Options) {
-		// Pointing at ElasticMQ instead of AWS. Unset this for real SQS.
 		if ep := envOr("SQS_ENDPOINT", "http://localhost:9324"); ep != "" {
 			o.BaseEndpoint = aws.String(ep)
 		}
@@ -203,6 +225,8 @@ func publish(ctx context.Context, c *sqs.Client, queueURL string, item TrendItem
 	})
 	return err
 }
+
+// ---- Hacker News API --------------------------------------------------------
 
 func fetchTopIDs() ([]int, error) {
 	resp, err := client.Get(base + "/topstories.json")
@@ -232,9 +256,20 @@ func fetchStory(id int) (Story, error) {
 	return s, nil
 }
 
+// ---- helpers ----------------------------------------------------------------
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return def
 }
