@@ -1,0 +1,67 @@
+services:
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.6.11
+    ports:
+      - "9324:9324"
+      - "9325:9325"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: trends
+      POSTGRES_PASSWORD: trends
+      POSTGRES_DB: trends
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trends"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  scraper:
+    build: ./scraper
+    depends_on:
+      - elasticmq
+    environment:
+      INTERVAL_SECONDS: "45"
+      SQS_ENDPOINT: http://elasticmq:9324
+      QUEUE_NAME: trends
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    ports:
+      - "8080:8080"
+
+  processor:
+    build: ./processor
+    depends_on:
+      elasticmq:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    environment:
+      SQS_ENDPOINT: http://elasticmq:9324
+      QUEUE_NAME: trends
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      DATABASE_URL: postgres://trends:trends@postgres:5432/trends?sslmode=disable
+    ports:
+      - "8081:8081"
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
