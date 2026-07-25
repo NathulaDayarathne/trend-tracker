@@ -1,5 +1,5 @@
 # ---- build stage: has the Go compiler ----
-FROM golang:1.22-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 # Copy dependency files first. Docker caches layers, so deps only re-download
