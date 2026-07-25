@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: processor
+  namespace: trends
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: processor }
+  template:
+    metadata:
+      labels: { app: processor }
+    spec:
+      containers:
+        - name: processor
+          image: trend-processor:local
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: trend-config }
+          ports:
+            - containerPort: 8081

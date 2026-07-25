@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scraper
+  namespace: trends
+spec:
+  schedule: "*/5 * * * *"       # every 5 minutes
+  concurrencyPolicy: Forbid      # don't overlap runs
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 120
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: scraper
+              image: trend-scraper:local
+              imagePullPolicy: IfNotPresent
+              envFrom:
+                - configMapRef: { name: trend-config }
+              env:
+                - { name: RUN_MODE, value: "once" }

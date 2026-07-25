@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elasticmq
+  namespace: trends
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: elasticmq }
+  template:
+    metadata:
+      labels: { app: elasticmq }
+    spec:
+      containers:
+        - name: elasticmq
+          image: softwaremill/elasticmq-native:1.6.11
+          ports:
+            - containerPort: 9324
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticmq
+  namespace: trends
+spec:
+  selector: { app: elasticmq }
+  ports:
+    - port: 9324
+      targetPort: 9324
