@@ -90,15 +90,19 @@ func main() {
 	}
 	log.Printf("publishing to %s", queueURL)
 
-	// Scrape once immediately, then on a ticker.
+	// CronJob runs us in "once" mode: scrape a single time and exit.
+	if envOr("RUN_MODE", "loop") == "once" {
+		runScrape(ctx, sqsClient, queueURL)
+		log.Println("single run complete, exiting")
+		return
+	}
+
+	// Loop mode (local / docker compose): scrape on a ticker forever.
 	runScrape(ctx, sqsClient, queueURL)
-
 	interval := time.Duration(envInt("INTERVAL_SECONDS", 60)) * time.Second
-	log.Printf("first run complete — looping every %s. Ctrl+C to stop.", interval)
-
+	log.Printf("looping every %s. Ctrl+C to stop.", interval)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		runScrape(ctx, sqsClient, queueURL)
 	}
